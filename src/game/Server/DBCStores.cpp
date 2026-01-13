@@ -172,6 +172,13 @@ std::string AcceptableClientBuildsListStr()
     return data.str();
 }
 
+bool IsModernClientBuild(uint32 build)
+{
+    // Modern clients are 1.14.x+ (builds >= 40000)
+    // Legacy clients are 1.12.x (builds 5875, 6005, 6141)
+    return build >= 40000;
+}
+
 static bool LoadDBC_assert_print(uint32 fsize, uint32 rsize, const std::string& filename)
 {
     sLog.outError("Size of '%s' setted by format string (%u) not equal size of C++ structure (%u).", filename.c_str(), fsize, rsize);

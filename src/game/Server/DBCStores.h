@@ -33,6 +33,7 @@
 
 bool IsAcceptableClientBuild(uint32 build);
 std::string AcceptableClientBuildsListStr();
+bool IsModernClientBuild(uint32 build); // Returns true for 1.14.x+ clients
 
 typedef std::list<uint32> SimpleFactionsList;
 

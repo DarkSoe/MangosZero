@@ -159,6 +159,12 @@ class WorldSocket : protected WorldHandler
 
         /// Called by ProcessIncoming() on CMSG_AUTH_SESSION.
         int HandleAuthSession(WorldPacket& recvPacket);
+        
+        /// Handle modern authentication (1.14.x+)
+        int HandleAuthSessionModern(WorldPacket& recvPacket);
+        
+        /// Handle legacy authentication (1.12.x)
+        int HandleAuthSessionLegacy(WorldPacket& recvPacket);
 
         /// Called by ProcessIncoming() on CMSG_PING.
         int HandlePing(WorldPacket& recvPacket);
@@ -214,6 +220,13 @@ class WorldSocket : protected WorldHandler
         PacketQueueT m_PacketQueue;
 
         const uint32 m_Seed;
+        
+        /// Modern client authentication data (1.14.x+)
+        uint8 m_ServerChallenge[16];
+        uint8 m_DosChallenge[32];
+        uint8 m_DosZeroBits;
+        bool m_IsModernClient;
+        uint32 m_ClientBuild;
 };
 
 #endif  /* _WORLDSOCKET_H */

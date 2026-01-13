@@ -46,6 +46,8 @@
 #include "Database/DatabaseEnv.h"
 #include "Auth/BigNumber.h"
 #include "Auth/Sha1.h"
+#include "Auth/Sha256.h"
+#include "Auth/HMACSHA256.h"
 #include "WorldSession.h"
 #include "WorldSocketMgr.h"
 #include "Log.h"
@@ -89,9 +91,20 @@ WorldSocket::WorldSocket(void) :
     m_OutBufferLock(),
     m_OutBuffer(0),
     m_OutBufferSize(65536),
-    m_Seed(rand32())
+    m_Seed(rand32()),
+    m_DosZeroBits(1),
+    m_IsModernClient(false),
+    m_ClientBuild(0)
 {
     reference_counting_policy().value(ACE_Event_Handler::Reference_Counting_Policy::ENABLED);
+    memset(m_ServerChallenge, 0, sizeof(m_ServerChallenge));
+    memset(m_DosChallenge, 0, sizeof(m_DosChallenge));
+    
+    // Generate random server challenge for modern clients
+    for (int i = 0; i < 16; ++i)
+        m_ServerChallenge[i] = rand32() & 0xFF;
+    for (int i = 0; i < 32; ++i)
+        m_DosChallenge[i] = rand32() & 0xFF;
 }
 
 WorldSocket::~WorldSocket(void)
@@ -225,7 +238,8 @@ int WorldSocket::open(void* a)
     // reactor takes care of the socket from now on
     remove_reference();
 
-    // Send startup packet.
+    // Send startup packet - legacy format for now
+    // Modern clients will be detected during auth session
     WorldPacket packet(SMSG_AUTH_CHALLENGE, 4);
     packet << m_Seed;
 
@@ -607,6 +621,27 @@ int WorldSocket::ProcessIncoming(WorldPacket* new_pct)
 
 int WorldSocket::HandleAuthSession(WorldPacket& recvPacket)
 {
+    // Peek at the build number to determine if this is a modern client
+    uint32 buildNumber = 0;
+    size_t pos = recvPacket.rpos();
+    recvPacket >> buildNumber;
+    recvPacket.rpos(pos);
+    
+    m_ClientBuild = buildNumber;
+    m_IsModernClient = IsModernClientBuild(buildNumber);
+    
+    if (m_IsModernClient)
+    {
+        return HandleAuthSessionModern(recvPacket);
+    }
+    else
+    {
+        return HandleAuthSessionLegacy(recvPacket);
+    }
+}
+
+int WorldSocket::HandleAuthSessionLegacy(WorldPacket& recvPacket)
+{
     // NOTE: ATM the socket is singlethread, have this in mind ...
     uint8 digest[SHA_DIGEST_LENGTH];
     uint32 clientSeed;
@@ -827,6 +862,215 @@ int WorldSocket::HandleAuthSession(WorldPacket& recvPacket)
         SendPacket(SendAddonPacked);
     }
 
+    return 0;
+}
+
+int WorldSocket::HandleAuthSessionModern(WorldPacket& recvPacket)
+{
+    // Modern client authentication (1.14.x+)
+    // Based on HermesProxy implementation
+    
+    uint64 dosResponse;
+    uint32 regionID;
+    uint32 battlegroupID;
+    uint32 realmID;
+    uint8 localChallenge[16];
+    uint8 digest[24];
+    bool useIPv6;
+    std::string realmJoinTicket;
+    
+    // Read AuthSession packet
+    recvPacket >> dosResponse;
+    recvPacket >> regionID;
+    recvPacket >> battlegroupID;
+    recvPacket >> realmID;
+    
+    recvPacket.read(localChallenge, 16);
+    recvPacket.read(digest, 24);
+    
+    // Read bit flags (simplified - read as uint8)
+    uint8 flags;
+    recvPacket >> flags;
+    useIPv6 = (flags & 0x01) != 0;
+    
+    uint32 realmJoinTicketSize = 0;
+    recvPacket >> realmJoinTicketSize;
+    if (realmJoinTicketSize > 0 && realmJoinTicketSize < 256)
+    {
+        realmJoinTicket.resize(realmJoinTicketSize);
+        recvPacket.read((uint8*)realmJoinTicket.c_str(), realmJoinTicketSize);
+    }
+    
+    DEBUG_LOG("WorldSocket::HandleAuthSessionModern: build %u, region %u, battlegroup %u, realm %u, ticket size %u",
+              m_ClientBuild, regionID, battlegroupID, realmID, realmJoinTicketSize);
+    
+    // For now, we'll use the realmJoinTicket as account name
+    // In a full implementation, this would be validated against Battle.net session
+    std::string account = realmJoinTicket;
+    
+    if (account.empty())
+    {
+        WorldPacket packet(SMSG_AUTH_RESPONSE, 1);
+        packet << uint8(AUTH_UNKNOWN_ACCOUNT);
+        SendPacket(packet);
+        sLog.outError("WorldSocket::HandleAuthSessionModern: Empty realm join ticket");
+        return -1;
+    }
+    
+    // Check the version of client trying to connect
+    if (!IsAcceptableClientBuild(m_ClientBuild))
+    {
+        WorldPacket packet(SMSG_AUTH_RESPONSE, 1);
+        packet << uint8(AUTH_VERSION_MISMATCH);
+        SendPacket(packet);
+        sLog.outError("WorldSocket::HandleAuthSessionModern: Sent Auth Response (version mismatch).");
+        return -1;
+    }
+    
+    // Get the account information from the realmd database
+    std::string safe_account = account;
+    LoginDatabase.escape_string(safe_account);
+    
+    QueryResult* result =
+        LoginDatabase.PQuery("SELECT "
+                             "`id`, "                      // 0
+                             "`gmlevel`, "                 // 1
+                             "`sessionkey`, "              // 2
+                             "`last_ip`, "                 // 3
+                             "`locked`, "                  // 4
+                             "`v`, "                       // 5
+                             "`s`, "                       // 6
+                             "`mutetime`, "                // 7
+                             "`locale`, "                   // 8
+                             "`os` "                        // 9
+                             "FROM `account` "
+                             "WHERE `username` = '%s'",
+                             safe_account.c_str());
+    
+    if (!result)
+    {
+        WorldPacket packet(SMSG_AUTH_RESPONSE, 1);
+        packet << uint8(AUTH_UNKNOWN_ACCOUNT);
+        SendPacket(packet);
+        sLog.outError("WorldSocket::HandleAuthSessionModern: Sent Auth Response (unknown account).");
+        return -1;
+    }
+    
+    const Field* fields = result->Fetch();
+    uint32 id = fields[0].GetUInt32();
+    uint32 security = fields[1].GetUInt16();
+    if (security > SEC_ADMINISTRATOR)
+        security = SEC_ADMINISTRATOR;
+    
+    BigNumber K;
+    K.SetHexStr(fields[2].GetString());
+    
+    time_t mutetime = time_t(fields[7].GetUInt64());
+    uint8 tmpLoc = fields[8].GetUInt8();
+    LocaleConstant locale = tmpLoc >= MAX_LOCALE ? LOCALE_enUS : LocaleConstant(tmpLoc);
+    std::string os = fields[9].GetString();
+    
+    delete result;
+    
+    // TODO: Implement proper modern authentication using SHA256 and HMAC-SHA256
+    // For now, we'll do a simplified version
+    
+    // Static seed for 1.14.x clients (from HermesProxy)
+    uint8 staticSeed[16] = {0x17, 0x9D, 0x3D, 0xC3, 0x23, 0x56, 0x29, 0xD0, 
+                             0x71, 0x13, 0xA9, 0xB3, 0x86, 0x7F, 0x97, 0xA7};
+    
+    // Calculate digest key hash
+    Sha256Hash digestKeyHash;
+    digestKeyHash.Initialize();
+    digestKeyHash.UpdateData(K.AsByteArray(), K.GetNumBytes());
+    digestKeyHash.Finalize();
+    
+    // Calculate HMAC
+    HMACSHA256 hmac(digestKeyHash.GetLength(), digestKeyHash.GetDigest());
+    hmac.UpdateData(localChallenge, 16);
+    hmac.UpdateData(m_ServerChallenge, 16);
+    hmac.Finalize();
+    
+    // Compare digest (first 24 bytes of HMAC)
+    uint8 calculatedDigest[24];
+    memcpy(calculatedDigest, hmac.GetDigest(), 24);
+    
+    if (memcmp(calculatedDigest, digest, 24) != 0)
+    {
+        WorldPacket packet(SMSG_AUTH_RESPONSE, 1);
+        packet << uint8(AUTH_FAILED);
+        SendPacket(packet);
+        sLog.outError("WorldSocket::HandleAuthSessionModern: Authentication failed (digest mismatch)");
+        return -1;
+    }
+    
+    // Generate session key
+    Sha256Hash keyData;
+    keyData.Initialize();
+    keyData.UpdateData(K.AsByteArray(), K.GetNumBytes());
+    keyData.Finalize();
+    
+    HMACSHA256 sessionKeyHmac(keyData.GetLength(), keyData.GetDigest());
+    sessionKeyHmac.UpdateData(m_ServerChallenge, 16);
+    sessionKeyHmac.UpdateData(localChallenge, 16);
+    sessionKeyHmac.Finalize();
+    
+    // Generate encryption key
+    uint8 sessionKey[40];
+    memcpy(sessionKey, sessionKeyHmac.GetDigest(), 32);
+    // TODO: Use SessionKeyGenerator for full 40 bytes
+    
+    HMACSHA256 encryptKeyGen(40, sessionKey);
+    encryptKeyGen.UpdateData(localChallenge, 16);
+    encryptKeyGen.UpdateData(m_ServerChallenge, 16);
+    encryptKeyGen.Finalize();
+    
+    uint8 encryptKey[16];
+    memcpy(encryptKey, encryptKeyGen.GetDigest(), 16);
+    
+    std::string address = GetRemoteAddress();
+    
+    DEBUG_LOG("WorldSocket::HandleAuthSessionModern: Client '%s' authenticated successfully from %s.",
+              account.c_str(), address.c_str());
+    
+    // Update last_ip
+    static SqlStatementID updAccount;
+    SqlStatement stmt = LoginDatabase.CreateStatement(updAccount, "UPDATE `account` SET `last_ip` = ? WHERE `username` = ?");
+    stmt.PExecute(address.c_str(), account.c_str());
+    
+    // Create session
+    ACE_NEW_RETURN(m_Session, WorldSession(id, this, AccountTypes(security), mutetime, locale), -1);
+    
+    // Set encryption key
+    m_Crypt.SetKey(encryptKey, 16);
+    m_Crypt.Init();
+    
+    m_Session->LoadTutorialsData();
+    
+    ACE_OS::sleep(ACE_Time_Value(0, 10000));
+    
+    sWorld.AddSession(m_Session);
+    
+    // Send AuthResponse with success
+    WorldPacket authResponse(SMSG_AUTH_RESPONSE, 100);
+    authResponse << uint32(0); // Success (AUTH_OK)
+    authResponse << uint8(1);  // HasSuccessInfo
+    authResponse << uint8(0);  // HasWaitInfo
+    
+    // SuccessInfo
+    authResponse << uint32(1);  // VirtualRealmAddress
+    authResponse << int32(0);   // VirtualRealms count
+    authResponse << uint32(0);  // TimeRested
+    authResponse << uint8(0);   // ActiveExpansionLevel
+    authResponse << uint8(0);   // AccountExpansionLevel
+    authResponse << uint32(0);  // TimeSecondsUntilPCKick
+    authResponse << int32(0);   // AvailableClasses count
+    authResponse << int32(0);   // Templates count
+    authResponse << uint32(0);  // CurrencyID
+    authResponse << int64(time(NULL)); // Time
+    
+    SendPacket(authResponse);
+    
     return 0;
 }
 
